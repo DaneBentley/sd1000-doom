@@ -118,7 +118,7 @@ the second buffer, the game was covered by a black OSD. Fix: clear both.
 - **Log (off by default):** create an empty `DOOMLOG.TXT` in the card root. Each launch then
   appends the startup log with millisecond timestamps, buffer pointers, a heartbeat every 2 s
   for the first 30 s of play, file opens, the exit code and the stack depth. Nothing else is
-  written during play. The file resets itself past 64 KB. Delete it to turn logging off.
+  written during play. The file resets itself past 256 KB (about 100 launches). Delete it to turn logging off.
 
 ## Known issues
 

@@ -65,7 +65,7 @@ static doom_cb_t cb;                  // passed to the blob; must outlive the ca
 // ~2 s for the first 30 s of play, every file open, and the exit code + stack depth. Nothing is
 // written during normal play after that. Each line is open -> lseek(END) -> write -> close
 // (O_APPEND is not honoured on VxWorks), so a hang still leaves every earlier line on the card.
-// The log keeps several launches side by side and resets itself past 64 KB.
+// The log keeps launches side by side (~2.5 KB each) and resets itself past 256 KB.
 #define LOG_PATH "A/DOOMLOG.TXT"
 static int g_diag = 0;                // DOOMLOG.TXT present at launch
 static int g_flog = 0;                // mirror scr_log() lines into the file right now
@@ -91,7 +91,7 @@ static void flog_start(void) {
     if (fd >= 0) {
         int size = lseek(fd, 0, SEEK_END);
         close(fd);
-        if (size > 65536) { fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0777); if (fd >= 0) close(fd); }
+        if (size > 262144) { fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0777); if (fd >= 0) close(fd); }
     }
     g_t0 = get_tick_count();
     g_flog = 1;
