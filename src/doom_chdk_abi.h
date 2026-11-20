@@ -34,7 +34,14 @@ typedef struct {
     int          (*should_quit)(void);
 } doom_cb_t;
 
-// blob entry, placed at the very start of the blob (.text.entry). Never returns.
+// doom_main return codes (the launcher only needs "returned at all"; codes are for the log)
+#define DOOM_RC_QUIT   1                 // in-game Quit Game (I_Quit / exit(0))
+#define DOOM_RC_PRINT  2                 // should_quit() fired (PRINT button)
+#define DOOM_RC_ERROR  3                 // I_Error / exit(nonzero)
+
+// blob entry, placed at the very start of the blob (.text.entry). Returns to the launcher on
+// Quit Game, PRINT or I_Error (-1 = ABI mismatch). The author's original prebuilt blob
+// (sha256 22b78378...) never returned: its loop had no should_quit() check at all.
 int doom_main(doom_cb_t *cb);
 
 #endif

@@ -3,6 +3,7 @@
 #include "doomgeneric.h"
 #include "doom_chdk_abi.h"
 #include <stdint.h>
+#include <setjmp.h>
 
 doom_cb_t *g_cb = 0;   // set by doom_main; used here and by chdk_syscalls.c
 
@@ -82,6 +83,21 @@ static int wants_quit = 0;
 static void on_doom_quit(void) { wants_quit = 1; }
 extern void I_AtExit(void (*func)(void), int run_on_error);
 
+// Not every exit goes through I_Quit's return: D_Endoom() (an atexit handler, show_endoom=1 by
+// default) calls exit(0) during Quit Game, and I_Error() calls exit(-1). newlib's exit() ends in
+// _exit(), which on bare metal can only spin forever - that spin used to hold CHDK's GUI task
+// hostage (no ALT teardown, LED blinking, battery pull). _exit() now jumps back here instead, so
+// every way out of the engine returns to the launcher.
+static jmp_buf s_exit_jmp;
+static volatile int s_exit_armed = 0;
+static volatile int s_exit_rc = 0;               // set before longjmp; setjmp's value is not stored
+void doom_exit_to_launcher(int code) {
+    if (!s_exit_armed) return;                     // not inside doom_main: caller spins
+    s_exit_armed = 0;
+    s_exit_rc = (code == 0) ? DOOM_RC_QUIT : DOOM_RC_ERROR;
+    longjmp(s_exit_jmp, 1);
+}
+
 int doom_main(doom_cb_t *cb) {
     char *p;                                       // zero BSS first, before touching any global
     for (p = __bss_start; p < __bss_end; p++) *p = 0;
@@ -89,12 +105,21 @@ int doom_main(doom_cb_t *cb) {
     if (cb->magic != DOOM_ABI_MAGIC) return -1;   // ABI sanity
     cb->log("DOOM BLOB ENTERED");                  // first-boot proof: jump landed + callback works
     static char *argv[] = { "doom", "-iwad", "A/DOOM1.WAD", 0 };
-    doomgeneric_Create(3, argv);
-    I_AtExit(on_doom_quit, 1);                      // make in-game "Quit Game" exit cleanly
-    for (;;) {
-        doomgeneric_Tick();
-        if (wants_quit || (cb->should_quit && cb->should_quit())) break;  // Quit Game or PRINT
+    int rc;
+    s_exit_rc = 0;
+    if (setjmp(s_exit_jmp) == 0) {                 // ISO C form; exit()/I_Error() return here != 0
+        s_exit_armed = 1;
+        doomgeneric_Create(3, argv);
+        I_AtExit(on_doom_quit, 1);                  // make in-game "Quit Game" exit cleanly
+        for (;;) {
+            doomgeneric_Tick();
+            if (wants_quit) { rc = DOOM_RC_QUIT; break; }                         // Quit Game
+            if (g_cb->should_quit && g_cb->should_quit()) { rc = DOOM_RC_PRINT; break; }  // PRINT
+        }
+        s_exit_armed = 0;
+        s_exit_rc = rc;
     }
-    cb->log("DOOM exit");
-    return 0;
+    rc = s_exit_rc;                                // volatile: valid on both paths after longjmp
+    g_cb->log(rc == DOOM_RC_ERROR ? "DOOM error exit" : "DOOM exit");
+    return rc;
 }

@@ -84,7 +84,14 @@ int _fstat(int fd, struct stat *st)    { (void)fd; st->st_mode = S_IFCHR; return
 int _isatty(int fd)                    { return fd < 3; }
 int _kill (int pid, int sig)           { (void)pid; (void)sig; errno = EINVAL; return -1; }
 int _getpid(void)                      { return 1; }
-void _exit(int code)                   { (void)code; for (;;) {} }
+extern void doom_exit_to_launcher(int code);  // doomgeneric_chdk.c: longjmp back to doom_main
+void _exit(int code)                   { doom_exit_to_launcher(code); for (;;) {} }
+// Replace newlib's exit() too. The xPack v5te/softfp libc multilib is compiled WITH VFP (GCC
+// spills to d8/s16: newlib's __call_exitprocs starts with `vpush {d8}`), and the camera's
+// ARM946E-S has no FPU, so newlib's exit() would die on an Undefined Instruction before ever
+// reaching _exit(). Same root cause as the newlib vfprintf "hang" doom_printf.c works around.
+// DOOM registers its own handlers via I_AtExit (already run by I_Quit/I_Error), never atexit().
+void exit(int code)                    { _exit(code); }
 int _gettimeofday(void *tv, void *tz)  { (void)tv; (void)tz; return 0; }
 int _link (const char *a, const char *b){ (void)a; (void)b; errno = EMLINK; return -1; }
 int _unlink(const char *a)             { (void)a; errno = ENOENT; return -1; }
