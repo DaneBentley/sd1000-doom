@@ -39,7 +39,7 @@ void gui_doom_draw();
 gui_handler GUI_MODE_DOOM =
     { GUI_MODE_MODULE, gui_doom_draw, gui_doom_kbd_process, 0, 0, GUI_MODE_FLAG_NODRAWRESTORE };
 
-#define DOOM_LAUNCHER_VERSION "ixus70-fixes-3"
+#define DOOM_LAUNCHER_VERSION "ixus70-fixes-4"
 #define BLOB_ADDR 0x00E80000u         // CACHED alias of the raw buffer (was 0x10E80000 uncached)
 #define RAW_SIZE  0x800000u           // 8MB
 
@@ -267,12 +267,17 @@ static void cb_draw_body(const unsigned char *fb, int w, int h) {
 // D-cache (write-back, read-allocate only on the ARM946) holds it and the stores hit the cache and
 // leave as burst write-backs instead of single-beat bus writes; 2 = benchmark: stores only (no
 // pixel math); 3 = benchmark: math only (all rows into one cached scratch row, no viewport).
-static int g_blit_mode = 0;
+// 4 = fast (default): fully unrolled 72-pixel kernel from tools/gen_blit.py, one chroma sample
+// per 4-pixel group instead of an average of four. Camera benchmark of mode 0 showed the pixel
+// math (~45 ms/frame), not the stores (~6.5 ms/frame), is the cost.
+#define BLIT_FAST 4
+static int g_blit_mode = BLIT_FAST;
 static unsigned int g_scratch_row[VP_BW / 4];
 static void __attribute__((target("arm"), optimize("O2"), noinline))
 blit_frame(const unsigned char *fb, int w, unsigned char *vp_uncached) {
     unsigned char *vp = (unsigned char *)((unsigned int)vp_uncached & ~0x10000000u);
     int mode = g_blit_mode;
+    const unsigned char *gu8 = (const unsigned char *)g_u, *gv8 = (const unsigned char *)g_v;
     const unsigned char *gy = g_y;
     const signed char *gu = g_u, *gv = g_v;
     int r, prev = -1;
@@ -282,6 +287,15 @@ blit_frame(const unsigned char *fb, int w, unsigned char *vp_uncached) {
         if (mode == 3) d = g_scratch_row;
         else if (src == prev) { memcpy(d, vp + (r - 1) * VP_BW, VP_BW); continue; }
         prev = src;
+        if (mode == BLIT_FAST) {
+            const unsigned char *row = fb + src * w;
+            int blk;
+            for (blk = 0; blk < VP_W / 72; blk++, d += 27) {
+                const unsigned char *s = row + blk * 32;
+#include "blit_kernel.h"
+            }
+            continue;
+        }
         if (mode == 1) {                           // pull the row's lines into the D-cache
             volatile const unsigned int *t = d; int k; unsigned int sink = 0;
             for (k = 0; k < VP_BW / 4; k += 8) sink += t[k];
@@ -512,25 +526,27 @@ static const char *choose_iwad(void) {
 }
 
 // Diagnostics only: time each blit variant on a synthetic frame before the game starts, log it,
-// and keep the faster of modes 0/1 for the game. ~20 blits per mode; 10 ms tick resolution.
+// and keep the fastest of modes 0/1/4 for the game. ~20 blits per mode; 10 ms tick resolution.
 static void blit_benchmark(void) {
     unsigned char *vp = VP_FB_D;
     unsigned char *fb = malloc(DOOMGENERIC_W * DOOMGENERIC_H);
     if (!vp || !fb) { if (fb) free(fb); return; }
-    int i, m, t[4];
+    int i, m, t[5];
     for (i = 0; i < DOOMGENERIC_W * DOOMGENERIC_H; i++) fb[i] = (unsigned char)(i * 7);
     for (i = 0; i < VP_W; i++) g_hx[i] = (unsigned short)(i * DOOMGENERIC_W / VP_W);
     for (i = 0; i < VP_H; i++) g_vy[i] = (unsigned char)(i * DOOMGENERIC_H / VP_H);
-    for (m = 0; m < 4; m++) {
+    for (m = 0; m < 5; m++) {
         g_blit_mode = m;
         int t0 = get_tick_count();
         for (i = 0; i < 20; i++) blit_frame(fb, DOOMGENERIC_W, vp);
         t[m] = get_tick_count() - t0;
     }
     free(fb);
-    g_blit_mode = (t[1] < t[0]) ? 1 : 0;
-    char m2[96];
-    sprintf(m2, "blit x20 ms: plain=%d touch=%d stores=%d math=%d -> mode %d", t[0], t[1], t[2], t[3], g_blit_mode);
+    g_blit_mode = BLIT_FAST;
+    if (t[0] < t[g_blit_mode]) g_blit_mode = 0;
+    if (t[1] < t[g_blit_mode]) g_blit_mode = 1;
+    char m2[112];
+    sprintf(m2, "blit x20 ms: plain=%d touch=%d stores=%d math=%d fast=%d -> mode %d", t[0], t[1], t[2], t[3], t[4], g_blit_mode);
     diag_log(m2);
 }
 
