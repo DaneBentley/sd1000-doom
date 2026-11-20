@@ -6,7 +6,7 @@
 #ifndef DOOM_CHDK_ABI_H
 #define DOOM_CHDK_ABI_H
 
-#define DOOM_ABI_MAGIC 0xD00D0001
+#define DOOM_ABI_MAGIC 0xD00D0002   // 2: + phase pointer (profiling), iwad
 
 typedef struct {
     unsigned int  magic;                 // DOOM_ABI_MAGIC (sanity)
@@ -32,7 +32,22 @@ typedef struct {
     // returns nonzero when the user asked to quit (launcher polls the quit key); blob breaks
     // its tick loop and returns from doom_main so the launcher can tear down cleanly.
     int          (*should_quit)(void);
+    // profiling (may be 0): the blob stores which part of the engine is running (DOOM_PH_*);
+    // the launcher samples it from another task.
+    volatile int *phase;
+    // IWAD chosen by the launcher ("A/DOOM2.WAD"...), or 0 = blob picks the first one found
+    const char   *iwad;
 } doom_cb_t;
+
+// engine phases written to *phase (wrapped engine functions, see build-blob.sh --wrap)
+#define DOOM_PH_OTHER   0   // main loop, D_Display glue, waiting for the next tic
+#define DOOM_PH_LOGIC   1   // G_Ticker: game simulation (thinkers, AI, physics)
+#define DOOM_PH_RENDER  2   // R_RenderPlayerView: the 3D view (BSP, walls, floors, sprites)
+#define DOOM_PH_2D      3   // ST_Drawer / HU_Drawer / M_Drawer: status bar, messages, menu
+#define DOOM_PH_FINISH  4   // I_FinishUpdate: copy to DG_ScreenBuffer + launcher's draw_frame
+#define DOOM_PH_WIPE    5   // wipe_ScreenWipe: screen melt
+#define DOOM_PH_LOAD    6   // P_SetupLevel: level load
+#define DOOM_PH_COUNT   7
 
 // doom_main return codes (the launcher only needs "returned at all"; codes are for the log)
 #define DOOM_RC_QUIT   1                 // in-game Quit Game (I_Quit / exit(0))

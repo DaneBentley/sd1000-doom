@@ -39,7 +39,7 @@ void gui_doom_draw();
 gui_handler GUI_MODE_DOOM =
     { GUI_MODE_MODULE, gui_doom_draw, gui_doom_kbd_process, 0, 0, GUI_MODE_FLAG_NODRAWRESTORE };
 
-#define DOOM_LAUNCHER_VERSION "ixus70-fixes-1"
+#define DOOM_LAUNCHER_VERSION "ixus70-fixes-2"
 #define BLOB_ADDR 0x00E80000u         // CACHED alias of the raw buffer (was 0x10E80000 uncached)
 #define RAW_SIZE  0x800000u           // 8MB
 
@@ -111,10 +111,16 @@ static inline void sp_watch(void) {
 // first frame (after that the OSD sits on top of the game, and scr_log's wrap would black it out).
 static int g_cleared;
 static void scr_log(const char *s);
+// which launcher callback the GUI task is executing (W_DOOM = DOOM's own code); read by the
+// KBD-task watchdog and profiler
+enum { W_DOOM, W_TICKS, W_SLEEP, W_KEY, W_DRAW, W_QUIT, W_OPEN, W_READ, W_WRITE, W_SEEK, W_CLOSE, W_LOG };
+static volatile int g_where;
 static void diag_log(const char *s) {
     if (!g_diag) return;
+    int w = g_where; g_where = W_LOG;              // profiler counts log writes separately
     if (!g_cleared) { int f = g_flog; g_flog = 1; scr_log(s); g_flog = f; }
     else flog_line(s);
+    g_where = w;
 }
 
 // Video buffer pointers: the firmware words around the ImagePlayer pointer (0x94408 =
@@ -150,12 +156,35 @@ static void scr_log(const char *s) {
 // --- instrumentation for the watchdog / diagnostics --------------------------
 // Counters/markers are written by the GUI task (inside the callbacks) and only READ by the KBD
 // task watchdog in gui_doom_kbd_process(). g_where = callback currently executing (0 = DOOM code).
-enum { W_DOOM, W_TICKS, W_SLEEP, W_KEY, W_DRAW, W_QUIT, W_OPEN, W_READ, W_WRITE, W_SEEK, W_CLOSE, W_LOG };
 static const char *const W_NAME[] = { "doom", "ticks", "sleep", "getkey", "draw", "quit", "open", "read", "write", "lseek", "close", "log" };
-static volatile int g_where = W_DOOM;
+static volatile int g_where = W_DOOM;           // (declared earlier for diag_log)
 static volatile unsigned int g_n_ticks, g_n_sleep, g_n_draw, g_n_quit, g_n_read;
 static volatile int g_rd_fd = -1, g_rd_n = 0, g_rd_ret = 0, g_running = 0;
 static volatile unsigned int g_last_vp = 0, g_now_ms = 0;
+static volatile int g_phase = DOOM_PH_OTHER;   // written by the blob (cb.phase)
+
+// Sampling profiler (KBD task, every ~10 ms while the game runs): one sample per call goes to
+// the launcher callback the GUI task is in (draw, sleep, file IO...) or, inside DOOM's own code,
+// to the engine phase the blob published. Reported in the diagnostics log every 10 s.
+enum { P_OTHER, P_LOGIC, P_RENDER, P_2D, P_FINISH, P_WIPE, P_LOAD,       // = DOOM_PH_*
+       P_DRAW, P_SLEEP, P_READ, P_KEY, P_TICKS, P_LOG, P_CB, P_COUNT };
+static const char *const P_NAME[P_COUNT] = { "oth", "logic", "r3d", "2d", "fin", "wipe", "load",
+       "draw", "sleep", "read", "key", "tick", "log", "cb" };
+static volatile unsigned int g_prof[P_COUNT];
+static void prof_sample(void) {
+    int b, w = g_where;
+    switch (w) {
+    case W_DOOM:  b = g_phase; if (b < 0 || b >= DOOM_PH_COUNT) b = P_OTHER; break;
+    case W_DRAW:  b = P_DRAW;  break;
+    case W_SLEEP: b = P_SLEEP; break;
+    case W_READ: case W_SEEK: case W_OPEN: case W_CLOSE: case W_WRITE: b = P_READ; break;
+    case W_KEY:   b = P_KEY;   break;
+    case W_TICKS: b = P_TICKS; break;
+    case W_LOG:   b = P_LOG;   break;
+    default:      b = P_CB;    break;
+    }
+    g_prof[b]++;
+}
 #define WHERE(w) int _w_save = g_where; g_where = (w)
 #define LEAVE()  g_where = _w_save
 
@@ -295,10 +324,27 @@ static int cb_getkey_body(int *pressed, unsigned char *key) {
 // 2 s, ~25 ms each) so a hang shows which counters stopped moving. This is how the "black
 // screen" was found to be a running-but-hidden game rather than a hang.
 static int g_hb_next = 0, g_hb_until = 0, g_hb_dumped = 0;
+// Profile line every 10 s for the whole session (diagnostics only): share of samples per bucket
+// in that window, frames per second (draw_frame calls) and samples per second (KBD task rate).
+static void prof_report(int now, int reset) {
+    static int t_last = 0, next = 0; static unsigned int last[P_COUNT], d_last = 0;
+    int i;
+    if (reset) { t_last = now; next = now + 10000; d_last = g_n_draw; for (i = 0; i < P_COUNT; i++) last[i] = g_prof[i]; return; }
+    if (now < next) return;
+    unsigned int d[P_COUNT], tot = 0;
+    for (i = 0; i < P_COUNT; i++) { d[i] = g_prof[i] - last[i]; last[i] = g_prof[i]; tot += d[i]; }
+    int dt = now - t_last; if (dt <= 0) dt = 1;
+    char m[200]; int n = sprintf(m, "prof %ds fps10=%d sps=%d |", dt / 1000, (int)((g_n_draw - d_last) * 10000 / dt),
+                                 (int)(tot * 1000 / dt));
+    for (i = 0; i < P_COUNT; i++) if (d[i]) n += sprintf(m + n, " %s=%d", P_NAME[i], (int)(d[i] * 100 / (tot ? tot : 1)));
+    diag_log(m);
+    t_last = now; next = now + 10000; d_last = g_n_draw;
+}
 static void heartbeat(void) {
     if (!g_diag) return;
     int now = get_tick_count();
-    if (!g_hb_until) { g_hb_until = now + 30000; g_hb_next = now + 2000; return; }
+    if (!g_hb_until) { g_hb_until = now + 30000; g_hb_next = now + 2000; prof_report(now, 1); return; }
+    prof_report(now, 0);
     if (now < g_hb_next || now > g_hb_until) return;
     g_hb_next = now + 2000;
     char m[96];
@@ -359,6 +405,55 @@ static int cb_close(int fd) {
     int r = close(fd); LEAVE(); return r;
 }
 
+// --- IWAD menu ----------------------------------------------------------------
+// Same search list as the blob. One IWAD on the card: use it. Several: list them; d-pad
+// up/down + SET to choose, the first one starts by itself after 5 s without input.
+static const char *const IWADS[] = {
+    "A/DOOM2.WAD", "A/PLUTONIA.WAD", "A/TNT.WAD", "A/DOOM.WAD",
+    "A/FREEDOM2.WAD", "A/freedoom2.wad", "A/FREEDOM1.WAD", "A/freedoom1.wad",
+    "A/DOOM1.WAD", 0
+};
+static const char *const IWAD_NAME[] = {
+    "DOOM II", "Final DOOM: Plutonia", "Final DOOM: TNT", "DOOM",
+    "Freedoom: Phase 2", "Freedoom: Phase 2", "Freedoom: Phase 1", "Freedoom: Phase 1",
+    "DOOM (shareware)"
+};
+#define MAX_IWADS 9
+static const char *choose_iwad(void) {
+    int found[MAX_IWADS], n = 0, i;
+    for (i = 0; IWADS[i]; i++) {
+        int fd = open(IWADS[i], O_RDONLY, 0777);
+        if (fd >= 0) { close(fd); found[n++] = i; }
+    }
+    if (n == 0) return 0;
+    if (n == 1) return IWADS[found[0]];
+    int x = camera_screen.disp_left + 8, y0 = 40, sel = 0, drawn = -1, waited = 0;
+    int up0 = 1, dn0 = 1, set0 = 1;                // treat keys as held until released once
+    draw_string_scaled(x, 16, "Choose game: UP/DOWN, SET", MAKE_COLOR(COLOR_BLACK, COLOR_YELLOW), 1, 1);
+    for (;;) {
+        if (sel != drawn) {
+            for (i = 0; i < n; i++) {
+                char m[40]; sprintf(m, "%c %s", i == sel ? '>' : ' ', IWAD_NAME[found[i]]);
+                draw_string_scaled(x, y0 + i * 18, m, MAKE_COLOR(COLOR_BLACK, i == sel ? COLOR_WHITE : COLOR_GREY), 1, 1);
+            }
+            drawn = sel;
+        }
+        int up = kbd_is_key_pressed(KEY_UP) ? 1 : 0, dn = kbd_is_key_pressed(KEY_DOWN) ? 1 : 0;
+        int st = kbd_is_key_pressed(KEY_SET) ? 1 : 0;
+        if (up && !up0) { sel = (sel + n - 1) % n; waited = -100000; }
+        if (dn && !dn0) { sel = (sel + 1) % n; waited = -100000; }
+        if (st && !set0) break;
+        up0 = up; dn0 = dn; set0 = st;
+        if (waited >= 5000) break;                 // untouched for 5 s: start the first one
+        msleep(20); waited += 20;
+    }
+    while (kbd_is_key_pressed(KEY_SET)) msleep(10);
+    draw_rectangle(camera_screen.disp_left, 0, camera_screen.disp_left + camera_screen.disp_width - 1,
+                   camera_screen.height - 1, MAKE_COLOR(COLOR_BLACK, COLOR_BLACK), RECT_BORDER0 | DRAW_FILLED);
+    logy = 4;
+    return IWADS[found[sel]];
+}
+
 // --- the launch sequence -----------------------------------------------------
 // Returns 1 when DOOM quit normally (PRINT / Quit Game), 0 on any abort or engine error.
 static int launch(void) {
@@ -370,6 +465,7 @@ static int launch(void) {
     if (g_diag) scr_log("diagnostics ON (A/DOOMLOG.TXT)");
     dump_vid_ptrs("start");
     g_n_ticks = g_n_sleep = g_n_draw = g_n_quit = g_n_read = 0; g_last_vp = 0; g_where = W_DOOM;
+    { int i; for (i = 0; i < P_COUNT; i++) g_prof[i] = 0; } g_phase = DOOM_PH_OTHER;
     g_hb_next = g_hb_until = g_hb_dumped = 0;
     { unsigned int sp; asm volatile ("mov %0, sp" : "=r"(sp)); g_sp_launch = sp; g_sp_min = sp;
       sprintf(msg, "launcher sp=%08x", sp); diag_log(msg); }
@@ -410,6 +506,9 @@ static int launch(void) {
     cb.arena_size = (raw + RAW_SIZE) - blob_end;
     cb.log        = scr_log;
     cb.should_quit = cb_should_quit;
+    cb.phase       = &g_phase;
+    cb.iwad        = choose_iwad();
+    if (cb.iwad) scr_log(cb.iwad);
     sprintf(msg, "arena=%u KB", cb.arena_size / 1024); scr_log(msg);
 
     fds_reset();
@@ -449,7 +548,10 @@ static void clear_viewport(void) {
 static void watchdog(void) {
     static unsigned int last_q = 0; static int last_change = 0, last_draw = 0;
     int now = get_tick_count();
-    if (!g_running) { last_q = g_n_quit; last_change = now; return; }
+    if (g_running && g_n_quit) prof_sample();
+    // armed only after the first game tick: startup with a big IWAD (R_InitTextures) can take
+    // far longer than 10 s and is not a hang
+    if (!g_running || !g_n_quit) { last_q = g_n_quit; last_change = now; return; }
     if (g_n_quit != last_q) { last_q = g_n_quit; last_change = now; return; }
     if (now - last_change < 10000 || now - last_draw < 1000) return;
     last_draw = now;

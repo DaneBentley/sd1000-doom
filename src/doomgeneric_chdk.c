@@ -114,6 +114,49 @@ void doom_exit_to_launcher(int code) {
     longjmp(s_exit_jmp, 1);
 }
 
+// --- profiling hooks ----------------------------------------------------------------------------
+// The link wraps a few engine entry points (build-blob.sh --wrap); each wrapper publishes the
+// current phase through cb->phase and restores the previous one on return (they nest: e.g.
+// P_SetupLevel runs inside G_Ticker). Costs two stores per call.
+#define PH_ENTER(ph) volatile int *_pp = g_cb->phase; int _old = _pp ? *_pp : 0; if (_pp) *_pp = (ph)
+#define PH_LEAVE()   if (_pp) *_pp = _old
+struct player_s;
+extern void __real_G_Ticker(void);
+extern void __real_R_RenderPlayerView(struct player_s *pl);
+extern void __real_ST_Drawer(int fullscreen, int refresh);
+extern void __real_HU_Drawer(void);
+extern void __real_M_Drawer(void);
+extern void __real_I_FinishUpdate(void);
+extern int  __real_wipe_ScreenWipe(int wipeno, int x, int y, int width, int height, int ticks);
+extern void __real_P_SetupLevel(int episode, int map, int playermask, int skill);
+void __wrap_G_Ticker(void) { PH_ENTER(DOOM_PH_LOGIC); __real_G_Ticker(); PH_LEAVE(); }
+void __wrap_R_RenderPlayerView(struct player_s *pl) { PH_ENTER(DOOM_PH_RENDER); __real_R_RenderPlayerView(pl); PH_LEAVE(); }
+void __wrap_ST_Drawer(int fs, int rf) { PH_ENTER(DOOM_PH_2D); __real_ST_Drawer(fs, rf); PH_LEAVE(); }
+void __wrap_HU_Drawer(void) { PH_ENTER(DOOM_PH_2D); __real_HU_Drawer(); PH_LEAVE(); }
+void __wrap_M_Drawer(void) { PH_ENTER(DOOM_PH_2D); __real_M_Drawer(); PH_LEAVE(); }
+void __wrap_I_FinishUpdate(void) { PH_ENTER(DOOM_PH_FINISH); __real_I_FinishUpdate(); PH_LEAVE(); }
+int  __wrap_wipe_ScreenWipe(int w, int x, int y, int wd, int h, int t) {
+    PH_ENTER(DOOM_PH_WIPE); int r = __real_wipe_ScreenWipe(w, x, y, wd, h, t); PH_LEAVE(); return r;
+}
+void __wrap_P_SetupLevel(int e, int m, int pm, int sk) { PH_ENTER(DOOM_PH_LOAD); __real_P_SetupLevel(e, m, pm, sk); PH_LEAVE(); }
+
+// --- IWAD selection: the first one found on the card wins ----------------------------------------
+// The engine identifies the game from the WAD's contents (MAP01 -> DOOM II, E1M1 -> DOOM), so
+// short 8.3 names are fine; long Freedoom names are tried too in case the card's FS has them.
+static const char *const IWADS[] = {
+    "A/DOOM2.WAD", "A/PLUTONIA.WAD", "A/TNT.WAD", "A/DOOM.WAD",
+    "A/FREEDOM2.WAD", "A/freedoom2.wad", "A/FREEDOM1.WAD", "A/freedoom1.wad",
+    "A/DOOM1.WAD", 0
+};
+static const char *pick_iwad(void) {
+    int i;
+    for (i = 0; IWADS[i]; i++) {
+        int fd = g_cb->f_open(IWADS[i], 0);
+        if (fd >= 0) { g_cb->f_close(fd); return IWADS[i]; }
+    }
+    return "A/DOOM1.WAD";              // let the engine report the missing IWAD
+}
+
 int doom_main(doom_cb_t *cb) {
     char *p;                                       // zero BSS first, before touching any global
     for (p = __bss_start; p < __bss_end; p++) *p = 0;
@@ -121,6 +164,8 @@ int doom_main(doom_cb_t *cb) {
     if (cb->magic != DOOM_ABI_MAGIC) return -1;   // ABI sanity
     cb->log("DOOM BLOB ENTERED");                  // first-boot proof: jump landed + callback works
     static char *argv[] = { "doom", "-iwad", "A/DOOM1.WAD", 0 };
+    argv[2] = (char *)(cb->iwad ? cb->iwad : pick_iwad());
+    cb->log(argv[2]);
     int rc;
     s_exit_rc = 0;
     if (setjmp(s_exit_jmp) == 0) {                 // ISO C form; exit()/I_Error() return here != 0
