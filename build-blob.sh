@@ -14,7 +14,12 @@ command -v arm-none-eabi-gcc >/dev/null || { echo "arm-none-eabi-gcc not found (
 TC="$(dirname "$(command -v arm-none-eabi-gcc)")/.."
 
 SRC="$HERE/build/doomgeneric/doomgeneric"
-[ -d "$SRC" ] || git clone --depth 1 https://github.com/ozkl/doomgeneric "$HERE/build/doomgeneric"
+# Pinned to the doomgeneric revision the shipped DOOM.BIN was built from and tested on camera.
+DG_REV="${DG_REV:-e257a09527062bfb986b6e5e0780839b6cbd5b71}"
+if [ ! -d "$SRC" ]; then
+  git clone https://github.com/ozkl/doomgeneric "$HERE/build/doomgeneric"
+  git -C "$HERE/build/doomgeneric" checkout -q "$DG_REV"
+fi
 # drop in the port files
 cp "$HERE"/src/doom_chdk_abi.h "$HERE"/src/doomgeneric_chdk.c "$HERE"/src/chdk_syscalls.c "$HERE"/src/doom_printf.c "$HERE"/src/doom_blob.ld "$SRC/"
 cd "$SRC"
