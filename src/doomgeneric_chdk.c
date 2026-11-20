@@ -43,6 +43,8 @@ void     DG_DrawFrame(void) {
 //   SET/DISP (ENTER) = save, MENU (ESC) = cancel.
 // We feed DOOM synthetic key events (a letter, or BACKSPACE+letter to replace) via a tiny queue.
 extern int saveStringEnter;            // m_menu.c global: nonzero while naming a save
+extern int messageToPrint;             // m_menu.c: a menu message is on screen
+extern int messageNeedsInput;          // m_menu.c (boolean, int-sized): it is a y/n question
 static unsigned char kq[4];            // queued synthetic DOOM keycodes
 static int kqn = 0, kqi = 0;
 static char wheel = 'A';
@@ -69,6 +71,10 @@ int DG_GetKey(int *pressed, unsigned char *key) {
         return 0;
     }
     if (saveStringEnter && p && (k == 13 || k == 27)) editing = 0;   // confirm/cancel ends editing
+    // Yes/no prompts ("quit?", "end game?", "nightmare?", quickload...) only accept 'y' / 'n' /
+    // ESC / space - and the camera has no 'y' key, so Quit Game could never be confirmed. While
+    // such a prompt is up, SET/DISP (ENTER) answers yes; MENU (ESC) still answers no.
+    if (messageToPrint && messageNeedsInput && k == 13) k = 'y';
     *pressed = p; *key = k; return 1;
 }
 
