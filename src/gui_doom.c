@@ -39,7 +39,7 @@ void gui_doom_draw();
 gui_handler GUI_MODE_DOOM =
     { GUI_MODE_MODULE, gui_doom_draw, gui_doom_kbd_process, 0, 0, GUI_MODE_FLAG_NODRAWRESTORE };
 
-#define DOOM_LAUNCHER_VERSION "ixus70-fixes-2"
+#define DOOM_LAUNCHER_VERSION "ixus70-fixes-3"
 #define BLOB_ADDR 0x00E80000u         // CACHED alias of the raw buffer (was 0x10E80000 uncached)
 #define RAW_SIZE  0x800000u           // 8MB
 
@@ -204,6 +204,8 @@ static void cb_sleep(unsigned int ms) { WHERE(W_SLEEP); g_n_sleep++; sp_watch();
 #define VP_W    720           // pixels per row
 #define VP_H    240           // rows in PLAY mode
 #define VP_FB_D (*(unsigned char **)0x94408)   // vid_get_viewport_fb_d (PLAY display buffer)
+#define DOOMGENERIC_W 320     // DOOM frame size (blob is built with DOOMGENERIC_RESX/RESY 320x200)
+#define DOOMGENERIC_H 200
 
 static unsigned char g_y[256];           // luma per index (0..255)
 static signed char   g_u[256], g_v[256]; // chroma per index (signed, centered 0)
@@ -261,17 +263,33 @@ static void cb_draw_body(const unsigned char *fb, int w, int h) {
 //    = two UYVYYY groups per 3 stores), then clean the D-cache so the display sees the frame;
 //  * rows that repeat a DOOM row (240 from 200) are memcpy'd from the row above;
 //  * compiled as ARM with -O2 (the module itself is Thumb/-Os).
+// g_blit_mode: 0 = plain; 1 = touch each 32-byte cache line of the destination row first, so the
+// D-cache (write-back, read-allocate only on the ARM946) holds it and the stores hit the cache and
+// leave as burst write-backs instead of single-beat bus writes; 2 = benchmark: stores only (no
+// pixel math); 3 = benchmark: math only (all rows into one cached scratch row, no viewport).
+static int g_blit_mode = 0;
+static unsigned int g_scratch_row[VP_BW / 4];
 static void __attribute__((target("arm"), optimize("O2"), noinline))
 blit_frame(const unsigned char *fb, int w, unsigned char *vp_uncached) {
     unsigned char *vp = (unsigned char *)((unsigned int)vp_uncached & ~0x10000000u);
+    int mode = g_blit_mode;
     const unsigned char *gy = g_y;
     const signed char *gu = g_u, *gv = g_v;
     int r, prev = -1;
     for (r = 0; r < VP_H; r++) {
         unsigned int *d = (unsigned int *)(vp + r * VP_BW);
         int src = g_vy[r];
-        if (src == prev) { memcpy(d, vp + (r - 1) * VP_BW, VP_BW); continue; }
+        if (mode == 3) d = g_scratch_row;
+        else if (src == prev) { memcpy(d, vp + (r - 1) * VP_BW, VP_BW); continue; }
         prev = src;
+        if (mode == 1) {                           // pull the row's lines into the D-cache
+            volatile const unsigned int *t = d; int k; unsigned int sink = 0;
+            for (k = 0; k < VP_BW / 4; k += 8) sink += t[k];
+            (void)sink;
+        } else if (mode == 2) {                    // raw store bandwidth
+            int k; for (k = 0; k < VP_BW / 4; k++) d[k] = 0x10801080u;
+            continue;
+        }
         const unsigned char *s = fb + src * w;
         const unsigned short *hx = g_hx;
         int g;
@@ -493,6 +511,29 @@ static const char *choose_iwad(void) {
     return IWADS[found[sel]];
 }
 
+// Diagnostics only: time each blit variant on a synthetic frame before the game starts, log it,
+// and keep the faster of modes 0/1 for the game. ~20 blits per mode; 10 ms tick resolution.
+static void blit_benchmark(void) {
+    unsigned char *vp = VP_FB_D;
+    unsigned char *fb = malloc(DOOMGENERIC_W * DOOMGENERIC_H);
+    if (!vp || !fb) { if (fb) free(fb); return; }
+    int i, m, t[4];
+    for (i = 0; i < DOOMGENERIC_W * DOOMGENERIC_H; i++) fb[i] = (unsigned char)(i * 7);
+    for (i = 0; i < VP_W; i++) g_hx[i] = (unsigned short)(i * DOOMGENERIC_W / VP_W);
+    for (i = 0; i < VP_H; i++) g_vy[i] = (unsigned char)(i * DOOMGENERIC_H / VP_H);
+    for (m = 0; m < 4; m++) {
+        g_blit_mode = m;
+        int t0 = get_tick_count();
+        for (i = 0; i < 20; i++) blit_frame(fb, DOOMGENERIC_W, vp);
+        t[m] = get_tick_count() - t0;
+    }
+    free(fb);
+    g_blit_mode = (t[1] < t[0]) ? 1 : 0;
+    char m2[96];
+    sprintf(m2, "blit x20 ms: plain=%d touch=%d stores=%d math=%d -> mode %d", t[0], t[1], t[2], t[3], g_blit_mode);
+    diag_log(m2);
+}
+
 // --- the launch sequence -----------------------------------------------------
 // Returns 1 when DOOM quit normally (PRINT / Quit Game), 0 on any abort or engine error.
 static int launch(void) {
@@ -551,6 +592,7 @@ static int launch(void) {
     if (cb.iwad) scr_log(cb.iwad);
     sprintf(msg, "arena=%u KB", cb.arena_size / 1024); scr_log(msg);
 
+    if (g_diag) blit_benchmark();
     fds_reset();
     scr_log("flush + JUMP ->");
     dcache_clean_all();          // push freshly written code from D-cache to RAM
