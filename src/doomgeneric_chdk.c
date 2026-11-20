@@ -43,6 +43,9 @@ void     DG_DrawFrame(void) {
 //   SET/DISP (ENTER) = save, MENU (ESC) = cancel.
 // We feed DOOM synthetic key events (a letter, or BACKSPACE+letter to replace) via a tiny queue.
 extern int saveStringEnter;            // m_menu.c global: nonzero while naming a save
+extern char savegamestrings[10][24];   // m_menu.c, SAVESTRINGSIZE = 24
+extern int saveSlot, saveCharIndex;    // m_menu.c: slot being named, cursor
+extern int gameepisode, gamemap;       // g_game.c: current level
 extern int messageToPrint;             // m_menu.c: a menu message is on screen
 extern int messageNeedsInput;          // m_menu.c (boolean, int-sized): it is a y/n question
 static unsigned char kq[4];            // queued synthetic DOOM keycodes
@@ -71,6 +74,13 @@ int DG_GetKey(int *pressed, unsigned char *key) {
         return 0;
     }
     if (saveStringEnter && p && (k == 13 || k == 27)) editing = 0;   // confirm/cancel ends editing
+    // DOOM silently refuses to save with an empty name, and spelling one with the wheel is slow.
+    // SET/DISP on an empty name saves it as the current level, e.g. "E1M3".
+    if (saveStringEnter && p && k == 13 && savegamestrings[saveSlot][0] == 0) {
+        char *n = savegamestrings[saveSlot];
+        n[0] = 'E'; n[1] = (char)('0' + gameepisode % 10); n[2] = 'M'; n[3] = (char)('0' + gamemap % 10); n[4] = 0;
+        saveCharIndex = 4;
+    }
     // Yes/no prompts ("quit?", "end game?", "nightmare?", quickload...) only accept 'y' / 'n' /
     // ESC / space - and the camera has no 'y' key, so Quit Game could never be confirmed. While
     // such a prompt is up, SET/DISP (ENTER) answers yes; MENU (ESC) still answers no.
