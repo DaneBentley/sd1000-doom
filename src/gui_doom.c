@@ -225,6 +225,7 @@ static void cb_setpal(const unsigned char *rgb) {
     }
 }
 static void cb_draw_body(const unsigned char *fb, int w, int h);
+static void blit_frame(const unsigned char *fb, int w, unsigned char *vp_uncached);
 static void cb_draw(const unsigned char *fb, int w, int h) {
     WHERE(W_DRAW); g_n_draw++; cb_draw_body(fb, w, h); LEAVE();
 }
@@ -251,22 +252,44 @@ static void cb_draw_body(const unsigned char *fb, int w, int h) {
         int r; for (r = 0; r < VP_H; r++) g_vy[r] = (unsigned char)(r * h / VP_H);
         g_cleared = 1;
     }
-    int r;
+    blit_frame(fb, w, vp);
+}
+
+// The blit: DOOM 320x200 8-bit -> 720x240 UYVYYY. Profiling showed the old byte-at-a-time loop
+// into the viewport's UNCACHED alias (0x10xxxxxx) took ~75% of every frame. Now:
+//  * write through the CACHED alias of the same RAM, as aligned 32-bit words (12 bytes = 8 px
+//    = two UYVYYY groups per 3 stores), then clean the D-cache so the display sees the frame;
+//  * rows that repeat a DOOM row (240 from 200) are memcpy'd from the row above;
+//  * compiled as ARM with -O2 (the module itself is Thumb/-Os).
+static void __attribute__((target("arm"), optimize("O2"), noinline))
+blit_frame(const unsigned char *fb, int w, unsigned char *vp_uncached) {
+    unsigned char *vp = (unsigned char *)((unsigned int)vp_uncached & ~0x10000000u);
+    const unsigned char *gy = g_y;
+    const signed char *gu = g_u, *gv = g_v;
+    int r, prev = -1;
     for (r = 0; r < VP_H; r++) {
-        const unsigned char *s = fb + g_vy[r] * w;
-        unsigned char *d = vp + r * VP_BW;
+        unsigned int *d = (unsigned int *)(vp + r * VP_BW);
+        int src = g_vy[r];
+        if (src == prev) { memcpy(d, vp + (r - 1) * VP_BW, VP_BW); continue; }
+        prev = src;
+        const unsigned char *s = fb + src * w;
+        const unsigned short *hx = g_hx;
         int g;
-        for (g = 0; g < VP_W; g += 4) {          // 4 viewport px = one UYVYYY group = 6 bytes
-            unsigned int q0 = s[g_hx[g]], q1 = s[g_hx[g+1]], q2 = s[g_hx[g+2]], q3 = s[g_hx[g+3]];
-            d[0] = (unsigned char)(((int)g_u[q0] + g_u[q1] + g_u[q2] + g_u[q3]) >> 2);  // shared U
-            d[1] = g_y[q0];
-            d[2] = (unsigned char)(((int)g_v[q0] + g_v[q1] + g_v[q2] + g_v[q3]) >> 2);  // shared V
-            d[3] = g_y[q1];
-            d[4] = g_y[q2];
-            d[5] = g_y[q3];
-            d += 6;
+        for (g = 0; g < VP_W; g += 8, hx += 8) {
+            unsigned int q0 = s[hx[0]], q1 = s[hx[1]], q2 = s[hx[2]], q3 = s[hx[3]];
+            unsigned int q4 = s[hx[4]], q5 = s[hx[5]], q6 = s[hx[6]], q7 = s[hx[7]];
+            unsigned int u0 = ((gu[q0] + gu[q1] + gu[q2] + gu[q3]) >> 2) & 0xFF;
+            unsigned int v0 = ((gv[q0] + gv[q1] + gv[q2] + gv[q3]) >> 2) & 0xFF;
+            unsigned int u1 = ((gu[q4] + gu[q5] + gu[q6] + gu[q7]) >> 2) & 0xFF;
+            unsigned int v1 = ((gv[q4] + gv[q5] + gv[q6] + gv[q7]) >> 2) & 0xFF;
+            // little-endian bytes: [U0 Y0 V0 Y1] [Y2 Y3 U1 Y4] [V1 Y5 Y6 Y7]
+            d[0] = u0 | (gy[q0] << 8) | (v0 << 16) | ((unsigned int)gy[q1] << 24);
+            d[1] = gy[q2] | (gy[q3] << 8) | (u1 << 16) | ((unsigned int)gy[q4] << 24);
+            d[2] = v1 | (gy[q5] << 8) | (gy[q6] << 16) | ((unsigned int)gy[q7] << 24);
+            d += 3;
         }
     }
+    dcache_clean_all();                            // push the cached frame out to RAM
 }
 
 // Input: poll the physical keys (Canon's kbd task keeps these live even while we sit in the
@@ -378,6 +401,11 @@ static int cb_open(const char *path, int wr) {
     diag_log(m);                                            // opens are rare
     LEAVE(); return r;
 }
+// Saves per game: every IWAD used to write the same doomsavN.dsg / temp.dsg in the card root, so
+// a DOOM save could be loaded into Freedoom. DOOM1 keeps the original names (existing saves stay
+// valid); other games get an 8.3 prefix: F1SAV0.DSG, F2TEMP.DSG, D2SAV3.DSG...
+static const char *g_save_pre = "";
+static int starts_with(const char *s, const char *p) { while (*p) if (*s++ != *p++) return 0; return 1; }
 static int cb_open_body(const char *path, int wr) {
     // Flatten every DOOM path to the card root: "A/<basename>". DOOM builds save/config paths that
     // can include a subdir (e.g. ".savegame/doomsav0.dsg") which can't exist on the card (mkdir is a
@@ -386,9 +414,18 @@ static int cb_open_body(const char *path, int wr) {
     const char *base = path, *q;
     for (q = path; *q; q++) if (*q == '/' || *q == '\\') base = q + 1;
     char buf[80];
-    int i = 0; buf[0] = 'A'; buf[1] = '/';
-    while (base[i] && i < 76) { buf[i + 2] = base[i]; i++; }
-    buf[i + 2] = 0;
+    if (g_save_pre[0] && starts_with(base, "doomsav") && base[7] >= '0' && base[7] <= '9') {
+        sprintf(buf, "A/%sSAV%c.DSG", g_save_pre, base[7]);
+        base = 0;
+    } else if (g_save_pre[0] && starts_with(base, "temp.dsg")) {
+        sprintf(buf, "A/%sTEMP.DSG", g_save_pre);
+        base = 0;
+    }
+    if (base) {
+        int i = 0; buf[0] = 'A'; buf[1] = '/';
+        while (base[i] && i < 76) { buf[i + 2] = base[i]; i++; }
+        buf[i + 2] = 0;
+    }
     int fd = open(buf, wr ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY, 0777);
     if (fd >= 0) { int k; for (k = 0; k < MAX_FDS; k++) if (g_fds[k] < 0) { g_fds[k] = fd; break; } }
     return fd;
@@ -413,6 +450,7 @@ static const char *const IWADS[] = {
     "A/FREEDOM2.WAD", "A/freedoom2.wad", "A/FREEDOM1.WAD", "A/freedoom1.wad",
     "A/DOOM1.WAD", 0
 };
+static const char *const IWAD_SAVE[] = { "D2", "PL", "TN", "DU", "F2", "F2", "F1", "F1", "" };
 static const char *const IWAD_NAME[] = {
     "DOOM II", "Final DOOM: Plutonia", "Final DOOM: TNT", "DOOM",
     "Freedoom: Phase 2", "Freedoom: Phase 2", "Freedoom: Phase 1", "Freedoom: Phase 1",
@@ -426,7 +464,7 @@ static const char *choose_iwad(void) {
         if (fd >= 0) { close(fd); found[n++] = i; }
     }
     if (n == 0) return 0;
-    if (n == 1) return IWADS[found[0]];
+    if (n == 1) { g_save_pre = IWAD_SAVE[found[0]]; return IWADS[found[0]]; }
     int x = camera_screen.disp_left + 8, y0 = 40, sel = 0, drawn = -1, waited = 0;
     int up0 = 1, dn0 = 1, set0 = 1;                // treat keys as held until released once
     draw_string_scaled(x, 16, "Choose game: UP/DOWN, SET", MAKE_COLOR(COLOR_BLACK, COLOR_YELLOW), 1, 1);
@@ -451,6 +489,7 @@ static const char *choose_iwad(void) {
     draw_rectangle(camera_screen.disp_left, 0, camera_screen.disp_left + camera_screen.disp_width - 1,
                    camera_screen.height - 1, MAKE_COLOR(COLOR_BLACK, COLOR_BLACK), RECT_BORDER0 | DRAW_FILLED);
     logy = 4;
+    g_save_pre = IWAD_SAVE[found[sel]];
     return IWADS[found[sel]];
 }
 
@@ -507,6 +546,7 @@ static int launch(void) {
     cb.log        = scr_log;
     cb.should_quit = cb_should_quit;
     cb.phase       = &g_phase;
+    g_save_pre     = "";
     cb.iwad        = choose_iwad();
     if (cb.iwad) scr_log(cb.iwad);
     sprintf(msg, "arena=%u KB", cb.arena_size / 1024); scr_log(msg);
@@ -542,20 +582,31 @@ static void clear_viewport(void) {
 // Canon menus) while the game is still running. The next PRINT press then exits normally.
 //
 // Watchdog, also KBD task, always on: if the blob has not finished a tick (should_quit count) for
-// 10 s, draw what the GUI task is doing on the OSD, refreshed each second. Drawing only - no file
-// IO from this task (it could deadlock behind a stuck file system call). Level loads take a few
-// seconds; 10 s avoids false alarms. The text stays visible over the game if it ever recovers.
+// 15 s outside a level load, draw what the GUI task is doing on the OSD, refreshed each second,
+// and erase it again if the game recovers. Drawing only - no file IO from this task (it could
+// deadlock behind a stuck file system call).
 static void watchdog(void) {
     static unsigned int last_q = 0; static int last_change = 0, last_draw = 0;
     int now = get_tick_count();
+    int x = camera_screen.disp_left + 4, y = camera_screen.height - 64;
     if (g_running && g_n_quit) prof_sample();
-    // armed only after the first game tick: startup with a big IWAD (R_InitTextures) can take
-    // far longer than 10 s and is not a hang
-    if (!g_running || !g_n_quit) { last_q = g_n_quit; last_change = now; return; }
-    if (g_n_quit != last_q) { last_q = g_n_quit; last_change = now; return; }
-    if (now - last_change < 10000 || now - last_draw < 1000) return;
+    // armed only after the first game tick (startup with a big IWAD can take a minute), and never
+    // while a level loads (Freedoom levels took ~11 s to load from the card - not a hang)
+    if (!g_running || !g_n_quit || g_phase == DOOM_PH_LOAD) { last_q = g_n_quit; last_change = now; return; }
+    if (g_n_quit != last_q) {
+        last_q = g_n_quit; last_change = now;
+        if (last_draw) {                           // recovered: erase our text from both OSD buffers
+            unsigned char *osd = vid_get_bitmap_fb();
+            int k; for (k = 0; k < 2; k++)
+                memset(osd + k * camera_screen.buffer_size + y * camera_screen.buffer_width, 0,
+                       64 * camera_screen.buffer_width);
+            last_draw = 0;
+        }
+        return;
+    }
+    if (now - last_change < 15000 || now - last_draw < 1000) return;
     last_draw = now;
-    char m[64]; int x = camera_screen.disp_left + 4, y = camera_screen.height - 64;
+    char m[64];
     color c = MAKE_COLOR(COLOR_RED, COLOR_WHITE);
     sprintf(m, "WD %ds in=%s q=%u d=%u", (now - last_change) / 1000, W_NAME[g_where], g_n_quit, g_n_draw);
     draw_string_scaled(x, y, m, c, 1, 1);
