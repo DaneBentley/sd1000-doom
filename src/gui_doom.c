@@ -212,8 +212,12 @@ static void cb_draw_body(const unsigned char *fb, int w, int h) {
     if (!g_cleared) {                            // first frame: hide the UI overlay, build scale maps
         char m[48]; sprintf(m, "first frame vp=%08x sp=%08x", (unsigned)vp, g_sp_min); diag_log(m);
         dump_vid_ptrs("frame1");
+        // The OSD is DOUBLE-buffered: Canon displays either fb or fb + buffer_size (active one at
+        // *(0x8564)), and CHDK's draw_pixel writes both (core/gui_draw.c). Clearing only the first
+        // left the launcher's opaque black log screen in the other buffer - on boots where Canon
+        // showed that one, DOOM ran fine but invisibly (black screen + last log line).
         unsigned char *osd = vid_get_bitmap_fb();
-        if (osd) { int n = camera_screen.buffer_width * camera_screen.height, k; for (k = 0; k < n; k++) osd[k] = 0; }
+        if (osd) { int n = camera_screen.buffer_size * 2, k; for (k = 0; k < n; k++) osd[k] = 0; }
         int c; for (c = 0; c < VP_W; c++) g_hx[c] = (unsigned short)(c * w / VP_W);
         int r; for (r = 0; r < VP_H; r++) g_vy[r] = (unsigned char)(r * h / VP_H);
         g_cleared = 1;
