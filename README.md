@@ -7,12 +7,19 @@ is soldered. Worst case at any point is pulling the battery.
 
 Verified playable and snappy on camera, 2026-06-27.
 
-> **This fork** (`ixus70-fixes` branch) adds a working exit: PRINT and in-game Quit Game both
-> return to Canon Playback cleanly, with no stuck frame, no Canon beeps under the game and no
-> battery pull. It also fixes the intermittent "black screen on startup". It was tested on an
-> IXUS 70 with firmware **1.01a** and CHDK 1.6.1-6355. Root causes and on-camera measurements
-> are in [`docs/IXUS70-FIXES.md`](docs/IXUS70-FIXES.md). `prebuilt/` is rebuilt from this source
-> and reproduces bit-for-bit.
+> **This fork** (`ixus70-fixes` branch), tested on an IXUS 70 with firmware **1.01a** and
+> CHDK 1.6.1-6355:
+>
+> - **Sound effects** through the camera speaker, mixed, borrowing Canon's own sound path.
+> - **About 2.5x faster**: 18–24 fps in E1M1, up from 7–8. The 320x200 → 720x240 blit was the
+>   bottleneck, not DOOM.
+> - **A working exit**: PRINT and in-game Quit Game both return to Canon Playback cleanly. No
+>   stuck frame, no Canon beeps under the game, no battery pull.
+> - The intermittent "black screen on startup" is fixed.
+> - **Freedoom** and the full DOOM / DOOM II IWADs, with a game picker. Saves are kept per game.
+>
+> Root causes and on-camera measurements are in [`docs/IXUS70-FIXES.md`](docs/IXUS70-FIXES.md).
+> `prebuilt/` is rebuilt from this source and reproduces bit-for-bit.
 
 ## How it works
 
@@ -39,8 +46,11 @@ so DOOM doesn't run as a normal CHDK module. Instead:
 - DOOM runs inside CHDK's GUI task and returns to the launcher on PRINT, Quit Game or an
   engine error. The launcher then waits for the keys to be released and leaves ALT mode, so
   CHDK unloads the module and Canon Playback comes back.
-- No sound yet. The audio path (Wolfson WM1400 codec behind Canon's ASIF DMA engine) is
-  reverse-engineered in `docs/AUDIO-WIP.md` but not wired up.
+- Sound (fork, firmware 1.01a): DOOM's sfx are 8-bit 11025 Hz, the same format as the camera's
+  own theme sounds. The launcher starts one long silent WAV through Canon's theme-sound path,
+  which powers and configures the WM1400 codec. It then mixes DOOM's sounds into that WAV
+  ahead of the playback position. No music. Background: `docs/AUDIO-WIP.md` and
+  `docs/IXUS70-FIXES.md`.
 
 ## Run it (prebuilt)
 
@@ -62,8 +72,13 @@ itself must match your firmware.
 4. Put a standard shareware `DOOM1.WAD` at the card root
    ([where to get it](https://doomwiki.org/wiki/DOOM1.WAD)). It must be the standard
    shareware WAD. A repacked one I tried was missing the STBAR lump and crashed the status
-   bar init.
-5. Boot the camera in PLAYBACK mode (the raw buffer is only free when you're not shooting),
+   bar init. You can also add (fork) `DOOM.WAD`, `DOOM2.WAD`, `PLUTONIA.WAD`, `TNT.WAD`, or
+   [Freedoom](https://freedoom.github.io/) renamed to `FREEDOM1.WAD` / `FREEDOM2.WAD`. With
+   more than one, a menu asks which game to start. A large IWAD takes about a minute to
+   start.
+5. (fork, sound) In the Canon menu, switch **Start-up Sound** on and set a volume. The sound
+   effects borrow that sound's slot.
+6. Boot the camera in PLAYBACK mode (the raw buffer is only free when you're not shooting),
    press the shortcut/print button to enter ALT mode, then MENU > Games > DOOM.
 
 ### Controls
