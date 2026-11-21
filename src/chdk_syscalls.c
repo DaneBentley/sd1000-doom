@@ -92,6 +92,10 @@ void _exit(int code)                   { doom_exit_to_launcher(code); for (;;) {
 // reaching _exit(). Same root cause as the newlib vfprintf "hang" doom_printf.c works around.
 // DOOM registers its own handlers via I_AtExit (already run by I_Quit/I_Error), never atexit().
 void exit(int code)                    { _exit(code); }
+// With FEATURE_SOUND, m_config.c binds float config variables; parsing one would call newlib's
+// strtod, which (like the rest of this libc's float code) contains VFP instructions. Nothing in
+// this port needs float config values, so atof never parses: returns 0.0 without touching VFP.
+double atof(const char *s)             { (void)s; return 0; }
 int _gettimeofday(void *tv, void *tz)  { (void)tv; (void)tz; return 0; }
 int _link (const char *a, const char *b){ (void)a; (void)b; errno = EMLINK; return -1; }
 int _unlink(const char *a)             { (void)a; errno = ENOENT; return -1; }

@@ -6,7 +6,7 @@
 #ifndef DOOM_CHDK_ABI_H
 #define DOOM_CHDK_ABI_H
 
-#define DOOM_ABI_MAGIC 0xD00D0002   // 2: + phase pointer (profiling), iwad
+#define DOOM_ABI_MAGIC 0xD00D0003   // 2: + phase pointer, iwad; 3: + play_sfx
 
 typedef struct {
     unsigned int  magic;                 // DOOM_ABI_MAGIC (sanity)
@@ -37,6 +37,9 @@ typedef struct {
     volatile int *phase;
     // IWAD chosen by the launcher ("A/DOOM2.WAD"...), or 0 = blob picks the first one found
     const char   *iwad;
+    // sound effect (may be 0 = no sound): 8-bit unsigned mono PCM, DOOM volume 0..127, stereo
+    // separation 0..254. Called from the game loop; the launcher copies the data before returning.
+    void         (*play_sfx)(const unsigned char *pcm, int len, int rate, int vol, int sep);
 } doom_cb_t;
 
 // engine phases written to *phase (wrapped engine functions, see build-blob.sh --wrap)

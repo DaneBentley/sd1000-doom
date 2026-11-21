@@ -21,11 +21,13 @@ if [ ! -d "$SRC" ]; then
   git -C "$HERE/build/doomgeneric" checkout -q "$DG_REV"
 fi
 # drop in the port files
-cp "$HERE"/src/doom_chdk_abi.h "$HERE"/src/doomgeneric_chdk.c "$HERE"/src/chdk_syscalls.c "$HERE"/src/doom_printf.c "$HERE"/src/doom_blob.ld "$SRC/"
+cp "$HERE"/src/doom_chdk_abi.h "$HERE"/src/doomgeneric_chdk.c "$HERE"/src/chdk_syscalls.c "$HERE"/src/doom_printf.c "$HERE"/src/doom_sound.c "$HERE"/src/doom_blob.ld "$SRC/"
 cd "$SRC"
 
 OUT="$HERE/build/obj"; rm -rf "$OUT"; mkdir -p "$OUT"
-CF="-c -march=armv5te -mtune=arm946e-s -Os -fno-strict-aliasing -fcommon -DNORMALUNIX -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200"
+# FEATURE_SOUND: sound effects via src/doom_sound.c (DG_sound_module); src/stub provides the empty
+# SDL_mixer.h that i_sound.c includes when FEATURE_SOUND is set.
+CF="-c -march=armv5te -mtune=arm946e-s -Os -fno-strict-aliasing -fcommon -DNORMALUNIX -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DFEATURE_SOUND -I$HERE/src/stub"
 # NOTE zsh users: run this with bash. $CF must word-split.
 # HOT_OPT (e.g. HOT_OPT=-O2): build the renderer's inner loops for speed instead of size.
 HOT_FILES=" r_draw.c r_plane.c r_segs.c r_bsp.c r_things.c r_main.c m_fixed.c i_video.c "

@@ -25,6 +25,7 @@ extern unsigned char *vid_get_bitmap_fb(void);
 extern void  vid_bitmap_refresh(void);     // repaint Canon's bitmap/overlay (restore screen on exit)
 extern void  gui_set_need_restore(void);   // tell CHDK its OSD needs a full redraw
 extern void  exit_alt(void);               // leave ALT mode -> unload module + back to clean Playback
+extern void  play_sound(unsigned sound);   // CHDK: PT_PlaySound(table[sound]); 0 = start-up sound 0x2001
 
 void gui_game_menu_kbd_process();
 int  gui_doom_kbd_process();
@@ -39,7 +40,7 @@ void gui_doom_draw();
 gui_handler GUI_MODE_DOOM =
     { GUI_MODE_MODULE, gui_doom_draw, gui_doom_kbd_process, 0, 0, GUI_MODE_FLAG_NODRAWRESTORE };
 
-#define DOOM_LAUNCHER_VERSION "ixus70-fixes-4"
+#define DOOM_LAUNCHER_VERSION "ixus70-fixes-5"
 #define BLOB_ADDR 0x00E80000u         // CACHED alias of the raw buffer (was 0x10E80000 uncached)
 #define RAW_SIZE  0x800000u           // 8MB
 
@@ -474,6 +475,65 @@ static int cb_close(int fd) {
     int r = close(fd); LEAVE(); return r;
 }
 
+// --- sound effects through Canon's own theme-sound path (firmware GM1.01A only) --------------------
+// PT_PlaySound(0x2001) makes MyCamFuncSound look up the start-up sound with 0xffaf6bec(id, &ptr,
+// &size), which returns {ptr, size} of a RIFF WAV from a RAM table (0x970f8, 16 bytes per sound),
+// then powers + configures the WM1400 codec and DMAs the PCM to the speaker. The camera's theme
+// sounds are 8-bit unsigned mono 11025 Hz - DOOM's sfx format. So for each DOOM sound we write a
+// WAV into our buffer, point the table entry at it, call play_sound(0) and restore the entry at
+// once (Canon reads ptr/size during the call; the DMA keeps reading our buffer afterwards).
+// Needs the Canon "Start-up Sound" enabled (otherwise there is no entry to borrow) and uses the
+// camera's sound volume. One sound at a time: a new one is dropped while the last still plays.
+#define SND_FW_VER   ((const char *)0xff818035)
+#define SND_LOOKUP   ((int (*)(int id, unsigned *ptr, unsigned *size))0xffaf6bec)
+#define SND_TABLE    ((volatile unsigned *)0x970f8)
+#define SND_ID       0x2001
+#define SFX_MAX      49152
+static unsigned char g_wav[44 + SFX_MAX] __attribute__((aligned(32)));
+static int g_snd_entry = -1;
+static unsigned g_snd_alias, g_snd_busy_until, g_sfx_played, g_sfx_dropped, g_sfx_call_max;
+static void put32(unsigned char *p, unsigned v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void snd_init(void) {
+    const char *v = SND_FW_VER;
+    unsigned p = 0, sz = 0;
+    int i; char m[64];
+    g_snd_entry = -1; g_sfx_played = g_sfx_dropped = g_sfx_call_max = 0; g_snd_busy_until = 0;
+    if (v[0] != 'G' || v[1] != 'M' || v[2] != '1' || v[3] != '.' || v[4] != '0' || v[5] != '1' || v[6] != 'A') {
+        diag_log("sound: not GM1.01A - off"); return;
+    }
+    if (!SND_LOOKUP(SND_ID, &p, &sz) || !p || !sz) { scr_log("sound off: enable Canon Start-up Sound"); return; }
+    for (i = 0; i < 32; i++) if (SND_TABLE[i * 4] == p && SND_TABLE[i * 4 + 1] == sz) { g_snd_entry = i; break; }
+    g_snd_alias = p & 0x10000000u;
+    // standard 44-byte header, PCM mono 8-bit; sizes/rate filled per sound
+    memcpy(g_wav, "RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\0\0\0\0\0\0\0\0\x01\0\x08\0data", 40);
+    sprintf(m, "sound: entry %d ptr %08x size %u", g_snd_entry, p, sz); diag_log(m);
+}
+static void cb_play_sfx(const unsigned char *pcm, int len, int rate, int vol, int sep) {
+    (void)sep;
+    if (g_snd_entry < 0 || len <= 0) return;
+    unsigned now = get_tick_count();
+    if (now < g_snd_busy_until) { g_sfx_dropped++; return; }
+    if (len > SFX_MAX) len = SFX_MAX;
+    if (vol < 0) vol = 0; else if (vol > 127) vol = 127;
+    unsigned char *d = g_wav + 44;
+    int i;
+    for (i = 0; i < len; i++) d[i] = (unsigned char)(128 + (((int)pcm[i] - 128) * vol >> 7));
+    put32(g_wav + 4, 36 + len);
+    put32(g_wav + 24, rate); put32(g_wav + 28, rate);        // sample rate, byte rate (8-bit mono)
+    put32(g_wav + 40, len);
+    dcache_clean_all();                            // the codec DMA reads RAM
+    volatile unsigned *e = SND_TABLE + g_snd_entry * 4;
+    unsigned op = e[0], os = e[1];
+    e[1] = 44 + len; e[0] = (unsigned)g_wav | g_snd_alias;
+    unsigned t0 = get_tick_count();
+    play_sound(0);
+    unsigned dt = get_tick_count() - t0;
+    e[0] = op; e[1] = os;
+    if (dt > g_sfx_call_max) g_sfx_call_max = dt;
+    g_sfx_played++;
+    g_snd_busy_until = get_tick_count() + (unsigned)len * 1000 / (unsigned)rate + 20;
+}
+
 // --- IWAD menu ----------------------------------------------------------------
 // Same search list as the blob. One IWAD on the card: use it. Several: list them; d-pad
 // up/down + SET to choose, the first one starts by itself after 5 s without input.
@@ -603,6 +663,8 @@ static int launch(void) {
     cb.log        = scr_log;
     cb.should_quit = cb_should_quit;
     cb.phase       = &g_phase;
+    snd_init();
+    cb.play_sfx    = (g_snd_entry >= 0) ? cb_play_sfx : 0;
     g_save_pre     = "";
     cb.iwad        = choose_iwad();
     if (cb.iwad) scr_log(cb.iwad);
@@ -620,6 +682,7 @@ static int launch(void) {
     g_flog = 1;                                    // log the exit too (only if diagnostics on)
     sprintf(msg, "DOOM returned rc=%d", rc); scr_log(msg);
     sprintf(msg, "stack: min sp=%08x, %u bytes below launcher", g_sp_min, g_sp_launch - g_sp_min); diag_log(msg);
+    { char m3[80]; sprintf(m3, "sfx played=%u dropped=%u max play_sound call=%u ms", g_sfx_played, g_sfx_dropped, g_sfx_call_max); diag_log(m3); }
     g_flog = 0;
     return (rc == DOOM_RC_PRINT || rc == DOOM_RC_QUIT);
 }
