@@ -14,21 +14,34 @@ command -v arm-none-eabi-gcc >/dev/null || { echo "arm-none-eabi-gcc not found (
 TC="$(dirname "$(command -v arm-none-eabi-gcc)")/.."
 
 SRC="$HERE/build/doomgeneric/doomgeneric"
-[ -d "$SRC" ] || git clone --depth 1 https://github.com/ozkl/doomgeneric "$HERE/build/doomgeneric"
+# Pinned to the doomgeneric revision the shipped DOOM.BIN was built from and tested on camera.
+DG_REV="${DG_REV:-e257a09527062bfb986b6e5e0780839b6cbd5b71}"
+if [ ! -d "$SRC" ]; then
+  git clone https://github.com/ozkl/doomgeneric "$HERE/build/doomgeneric"
+  git -C "$HERE/build/doomgeneric" checkout -q "$DG_REV"
+fi
 # drop in the port files
-cp "$HERE"/src/doom_chdk_abi.h "$HERE"/src/doomgeneric_chdk.c "$HERE"/src/chdk_syscalls.c "$HERE"/src/doom_printf.c "$HERE"/src/doom_blob.ld "$SRC/"
+cp "$HERE"/src/doom_chdk_abi.h "$HERE"/src/doomgeneric_chdk.c "$HERE"/src/chdk_syscalls.c "$HERE"/src/doom_printf.c "$HERE"/src/doom_sound.c "$HERE"/src/doom_blob.ld "$SRC/"
 cd "$SRC"
 
 OUT="$HERE/build/obj"; rm -rf "$OUT"; mkdir -p "$OUT"
-CF="-c -march=armv5te -mtune=arm946e-s -Os -fno-strict-aliasing -fcommon -DNORMALUNIX -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200"
+# FEATURE_SOUND: sound effects via src/doom_sound.c (DG_sound_module); src/stub provides the empty
+# SDL_mixer.h that i_sound.c includes when FEATURE_SOUND is set.
+CF="-c -march=armv5te -mtune=arm946e-s -Os -fno-strict-aliasing -fcommon -DNORMALUNIX -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 -DFEATURE_SOUND -I$HERE/src/stub"
 # NOTE zsh users: run this with bash. $CF must word-split.
+# HOT_OPT (e.g. HOT_OPT=-O2): build the renderer's inner loops for speed instead of size.
+HOT_FILES=" r_draw.c r_plane.c r_segs.c r_bsp.c r_things.c r_main.c m_fixed.c i_video.c "
 for c in $(ls *.c | grep -vE "doomgeneric_(xlib|sdl|sosox?|emscripten|fb|kitty|curses|allegro|linuxvt|win)\.c|i_allegro|i_sdl"); do
-  arm-none-eabi-gcc $CF -o "$OUT/${c%.c}.o" "$c"
+  FLAGS="$CF"
+  if [ -n "$HOT_OPT" ] && [[ "$HOT_FILES" == *" $c "* ]]; then FLAGS="${CF/-Os/$HOT_OPT}"; fi
+  arm-none-eabi-gcc $FLAGS -o "$OUT/${c%.c}.o" "$c"
 done
 
 LIBC="$TC/arm-none-eabi/lib/arm/v5te/softfp/libc.a"
 LIBGCC="$(ls "$TC"/lib/gcc/arm-none-eabi/*/arm/v5te/softfp/libgcc.a | head -1)"
-arm-none-eabi-gcc -nostartfiles -nostdlib -Wl,-T,doom_blob.ld -Wl,-Map,"$OUT/doom_blob.map" \
+# --wrap: profiling hooks in doomgeneric_chdk.c (__wrap_X sets the phase, calls __real_X)
+WRAP="-Wl,--wrap=G_Ticker,--wrap=R_RenderPlayerView,--wrap=ST_Drawer,--wrap=HU_Drawer,--wrap=M_Drawer,--wrap=I_FinishUpdate,--wrap=wipe_ScreenWipe,--wrap=P_SetupLevel"
+arm-none-eabi-gcc -nostartfiles -nostdlib $WRAP -Wl,-T,doom_blob.ld -Wl,-Map,"$OUT/doom_blob.map" \
   -o "$OUT/doom_blob.elf" -Wl,--start-group "$OUT"/*.o "$LIBC" "$LIBGCC" -Wl,--end-group
 arm-none-eabi-objcopy -O binary "$OUT/doom_blob.elf" "$HERE/DOOM.BIN"
 echo "built DOOM.BIN:"; ls -la "$HERE/DOOM.BIN"
